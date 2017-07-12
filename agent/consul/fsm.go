@@ -165,6 +165,7 @@ func (c *consulFSM) applyKVSOperation(buf []byte, index uint64) interface{} {
 	if err := structs.Decode(buf, &req); err != nil {
 		panic(fmt.Errorf("failed to decode request: %v", err))
 	}
+	start := time.Now()
 	defer metrics.MeasureSince([]string{"consul", "fsm", "kvs", string(req.Op)}, time.Now())
 	switch req.Op {
 	case api.KVSet:
@@ -178,7 +179,10 @@ func (c *consulFSM) applyKVSOperation(buf []byte, index uint64) interface{} {
 		}
 		return act
 	case api.KVDeleteTree:
-		return c.state.KVSDeleteTree(index, req.DirEnt.Key)
+		err := c.state.KVSDeleteTree(index, req.DirEnt.Key)
+		t := time.Now().Sub(start).Seconds()
+		c.logger.Println("Delete tree took ", t, " seconds")
+		return err
 	case api.KVCAS:
 		act, err := c.state.KVSSetCAS(index, &req.DirEnt)
 		if err != nil {
