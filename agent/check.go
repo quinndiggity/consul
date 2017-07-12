@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/armon/circbuf"
-	docker "github.com/fsouza/go-dockerclient"
 	"github.com/hashicorp/consul/agent/consul/structs"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/lib"
@@ -516,14 +515,6 @@ func (c *CheckTCP) check() {
 	c.Notify.UpdateCheck(c.CheckID, api.HealthPassing, fmt.Sprintf("TCP connect %s: Success", c.TCP))
 }
 
-// DockerClient defines an interface for a docker client
-// which is used for injecting a fake client during tests.
-type DockerClient interface {
-	CreateExec(docker.CreateExecOptions) (*docker.Exec, error)
-	StartExec(string, docker.StartExecOptions) error
-	InspectExec(string) (*docker.ExecInspect, error)
-}
-
 // CheckDocker is used to periodically invoke a script to
 // determine the health of an application running inside a
 // Docker Container. We assume that the script is compatible
@@ -537,21 +528,33 @@ type CheckDocker struct {
 	Interval          time.Duration
 	Logger            *log.Logger
 
-	dockerClient DockerClient
-	cmd          []string
-	stop         bool
-	stopCh       chan struct{}
-	stopLock     sync.Mutex
+	client   *DockerClient
+	cmd      []string
+	stop     bool
+	stopCh   chan struct{}
+	stopLock sync.Mutex
 }
 
 // Init initializes the Docker Client
 func (c *CheckDocker) Init() error {
-	var err error
-	c.dockerClient, err = docker.NewClientFromEnv()
+	// todo(fs): does this call need to be idempotent?
+
+	dc, err := NewDockerClient(os.Getenv("DOCKER_HOST"), CheckBufSize)
 	if err != nil {
-		c.Logger.Printf("[DEBUG] Error creating the Docker client: %s", err.Error())
+		c.Logger.Printf("[ERR] agent: error creating docker client: %s", err)
 		return err
 	}
+	c.client = dc
+
+	// todo(fs): we should not patch c.Shell here but use a local var
+	if c.Shell == "" {
+		c.Shell = os.Getenv("SHELL")
+		if c.Shell == "" {
+			c.Shell = "/bin/sh"
+		}
+	}
+	c.cmd = []string{c.Shell, "-c", c.Script}
+
 	return nil
 }
 
@@ -560,14 +563,8 @@ func (c *CheckDocker) Init() error {
 func (c *CheckDocker) Start() {
 	c.stopLock.Lock()
 	defer c.stopLock.Unlock()
-
-	//figure out the shell
-	if c.Shell == "" {
-		c.Shell = shell()
-	}
-
-	c.cmd = []string{c.Shell, "-c", c.Script}
-
+	// todo(fs): we don't need stop since stopCh != nil is enough
+	// todo(fs): we should check if we're already running and then stop first
 	c.stop = false
 	c.stopCh = make(chan struct{})
 	go c.run()
@@ -601,73 +598,50 @@ func (c *CheckDocker) run() {
 }
 
 func (c *CheckDocker) check() {
-	//Set up the Exec since
-	execOpts := docker.CreateExecOptions{
-		AttachStdin:  false,
-		AttachStdout: true,
-		AttachStderr: true,
-		Tty:          false,
-		Cmd:          c.cmd,
-		Container:    c.DockerContainerID,
-	}
-	var (
-		exec *docker.Exec
-		err  error
-	)
-	if exec, err = c.dockerClient.CreateExec(execOpts); err != nil {
-		c.Logger.Printf("[DEBUG] agent: Error while creating Exec: %s", err.Error())
-		c.Notify.UpdateCheck(c.CheckID, api.HealthCritical, fmt.Sprintf("Unable to create Exec, error: %s", err.Error()))
-		return
-	}
-
-	// Collect the output
-	output, _ := circbuf.NewBuffer(CheckBufSize)
-
-	err = c.dockerClient.StartExec(exec.ID, docker.StartExecOptions{Detach: false, Tty: false, OutputStream: output, ErrorStream: output})
+	var out string
+	status, b, err := c.doCheck(c.client)
 	if err != nil {
-		c.Logger.Printf("[DEBUG] Error in executing health checks: %s", err.Error())
-		c.Notify.UpdateCheck(c.CheckID, api.HealthCritical, fmt.Sprintf("Unable to start Exec: %s", err.Error()))
-		return
+		c.Logger.Printf("[DEBUG] agent: Check '%s': %s", c.CheckID, err)
+		out = err.Error()
+	} else {
+		// out is already limited to CheckBufSize since we're getting a
+		// limited buffer. So we don't need to truncate it just report
+		// that it was truncated.
+		out = string(b.Bytes())
+		if int(b.TotalWritten()) > len(out) {
+			out = fmt.Sprintf("Captured %d of %d bytes\n...\n%s", len(out), b.TotalWritten(), out)
+		}
+		c.Logger.Printf("[DEBUG] agent: Check '%s' script '%s' output: %s", c.CheckID, c.Script, out)
 	}
 
-	// Get the output, add a message about truncation
-	outputStr := string(output.Bytes())
-	if output.TotalWritten() > output.Size() {
-		outputStr = fmt.Sprintf("Captured %d of %d bytes\n...\n%s",
-			output.Size(), output.TotalWritten(), outputStr)
+	if status == api.HealthCritical {
+		c.Logger.Printf("[WARN] agent: Check '%v' is now critical", c.CheckID)
 	}
 
-	c.Logger.Printf("[DEBUG] agent: Check '%s' script '%s' output: %s",
-		c.CheckID, c.Script, outputStr)
-
-	execInfo, err := c.dockerClient.InspectExec(exec.ID)
-	if err != nil {
-		c.Logger.Printf("[DEBUG] Error in inspecting check result : %s", err.Error())
-		c.Notify.UpdateCheck(c.CheckID, api.HealthCritical, fmt.Sprintf("Unable to inspect Exec: %s", err.Error()))
-		return
-	}
-
-	// Sets the status of the check to healthy if exit code is 0
-	if execInfo.ExitCode == 0 {
-		c.Notify.UpdateCheck(c.CheckID, api.HealthPassing, outputStr)
-		return
-	}
-
-	// Set the status of the check to Warning if exit code is 1
-	if execInfo.ExitCode == 1 {
-		c.Logger.Printf("[DEBUG] Check failed with exit code: %d", execInfo.ExitCode)
-		c.Notify.UpdateCheck(c.CheckID, api.HealthWarning, outputStr)
-		return
-	}
-
-	// Set the health as critical
-	c.Logger.Printf("[WARN] agent: Check '%v' is now critical", c.CheckID)
-	c.Notify.UpdateCheck(c.CheckID, api.HealthCritical, outputStr)
+	c.Notify.UpdateCheck(c.CheckID, status, out)
 }
 
-func shell() string {
-	if sh := os.Getenv("SHELL"); sh != "" {
-		return sh
+func (c *CheckDocker) doCheck(dc *DockerClient) (string, *circbuf.Buffer, error) {
+	execID, err := dc.CreateExec(c.DockerContainerID, c.cmd)
+	if err != nil {
+		return api.HealthCritical, nil, err
 	}
-	return "/bin/sh"
+	buf, err := dc.StartExec(execID)
+	if err != nil {
+		return api.HealthCritical, nil, err
+	}
+	exitCode, err := dc.InspectExec(execID)
+	if err != nil {
+		return api.HealthCritical, nil, err
+	}
+	switch exitCode {
+	case 0:
+		return api.HealthPassing, buf, nil
+	case 1:
+		c.Logger.Printf("[DEBUG] Check failed with exit code: %d", exitCode)
+		return api.HealthWarning, buf, nil
+	default:
+		c.Logger.Printf("[DEBUG] Check failed with exit code: %d", exitCode)
+		return api.HealthCritical, buf, nil
+	}
 }
