@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"fmt"
+
 	"github.com/hashicorp/consul/agent/consul/structs"
 	"github.com/hashicorp/go-memdb"
 )
@@ -1018,6 +1020,81 @@ func TestStateStore_KVSDeleteTree(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 	if idx != 4 {
+		t.Fatalf("bad index: %d", idx)
+	}
+}
+
+func TestStateStore_KVSDeleteTreePrefix(t *testing.T) {
+	s := testStateStore(t)
+
+	// Create kvs entries in the state store.
+	for i := 0; i < 120; i++ {
+		ind := uint64(i + 1)
+		key := "foo/bar" + fmt.Sprintf("%d", ind)
+		testSetKey(t, s, ind, key, "bar")
+	}
+	testSetKey(t, s, 121, "foo/zorp", "zorp")
+
+	// Calling tree deletion which affects nothing does not
+	// modify the table index.
+	if err := s.KVSDeleteTree(129, "bar"); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if idx := s.maxIndex("kvs"); idx != 121 {
+		t.Fatalf("bad index: %d", idx)
+	}
+
+	// Call tree deletion with a nested prefix.
+	if err := s.KVSDeleteTree(122, "foo/bar"); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Check that all the matching keys were deleted
+	tx := s.db.Txn(false)
+	defer tx.Abort()
+
+	entries, err := tx.Get("kvs", "id")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	num := 0
+	for entry := entries.Next(); entry != nil; entry = entries.Next() {
+		if entry.(*structs.DirEntry).Key != "foo/zorp" {
+			t.Fatalf("unexpected kvs entry: %#v", entry)
+		}
+		num++
+	}
+
+	if num != 1 {
+		t.Fatalf("expected 1 key, got: %d", num)
+	}
+
+	// Index should be updated if modifications are made
+	if idx := s.maxIndex("kvs"); idx != 122 {
+		t.Fatalf("bad index: %d", idx)
+	}
+
+	// Check that the tombstones ware created and that prevents the index
+	// from sliding backwards.
+	idx, _, err := s.KVSList(nil, "foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if idx != 122 {
+		t.Fatalf("bad index: %d", idx)
+	}
+
+	// Now reap the tombstones and watch the index revert to the remaining
+	// foo/zorp key's index.
+	if err := s.ReapTombstones(122); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	idx, _, err = s.KVSList(nil, "foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if idx != 121 {
 		t.Fatalf("bad index: %d", idx)
 	}
 }
