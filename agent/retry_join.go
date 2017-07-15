@@ -2,20 +2,29 @@ package agent
 
 import (
 	"fmt"
+	"strings"
 	"time"
+
+	discover "github.com/hashicorp/go-discover"
 )
 
 // RetryJoin is used to handle retrying a join until it succeeds or all
 // retries are exhausted.
 func (a *Agent) retryJoin() {
 	cfg := a.config
-
-	ec2Enabled := cfg.RetryJoinEC2.TagKey != "" && cfg.RetryJoinEC2.TagValue != ""
-	gceEnabled := cfg.RetryJoinGCE.TagValue != ""
-	azureEnabled := cfg.RetryJoinAzure.TagName != "" && cfg.RetryJoinAzure.TagValue != ""
-
-	if len(cfg.RetryJoin) == 0 && !ec2Enabled && !gceEnabled && !azureEnabled {
+	if len(cfg.RetryJoin) == 0 {
 		return
+	}
+
+	// split retry join addresses from go-discover statements
+	var addrs []string
+	var disco string
+	for _, addr := range cfg.RetryJoin {
+		if strings.Contains(addr, "provider=") {
+			disco = addr
+			continue
+		}
+		addrs = append(addrs, addr)
 	}
 
 	a.logger.Printf("[INFO] agent: Joining cluster...")
@@ -23,28 +32,15 @@ func (a *Agent) retryJoin() {
 	for {
 		var servers []string
 		var err error
-		switch {
-		case ec2Enabled:
-			servers, err = cfg.discoverEc2Hosts(a.logger)
+		if disco != "" {
+			servers, err = discover.Addrs(disco, a.logger)
 			if err != nil {
-				a.logger.Printf("[ERR] agent: Unable to query EC2 instances: %s", err)
+				a.logger.Printf("[ERR] agent: %s", err)
 			}
-			a.logger.Printf("[INFO] agent: Discovered %d servers from EC2", len(servers))
-		case gceEnabled:
-			servers, err = cfg.discoverGCEHosts(a.logger)
-			if err != nil {
-				a.logger.Printf("[ERR] agent: Unable to query GCE instances: %s", err)
-			}
-			a.logger.Printf("[INFO] agent: Discovered %d servers from GCE", len(servers))
-		case azureEnabled:
-			servers, err = cfg.discoverAzureHosts(a.logger)
-			if err != nil {
-				a.logger.Printf("[ERR] agent: Unable to query Azure instances: %s", err)
-			}
-			a.logger.Printf("[INFO] agent: Discovered %d servers from Azure", len(servers))
+			a.logger.Printf("[ERR] agent: Discovered servers: %v", servers)
 		}
 
-		servers = append(servers, cfg.RetryJoin...)
+		servers = append(servers, addrs...)
 		if len(servers) == 0 {
 			err = fmt.Errorf("No servers to join")
 		} else {
